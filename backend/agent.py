@@ -28,15 +28,16 @@ REDIS_TOKEN = os.environ["UPSTASH_REDIS_REST_TOKEN"]
 GOOGLE_API_KEY = os.environ["GOOGLE_API_KEY"]
 FOCUS_DRIVERS = [int(x) for x in os.environ.get("FOCUS_DRIVERS", "1,11,16").split(",")]
 
-# Gemini setup — use 3.1 Flash-Lite (highest free RPD)
+# Gemini setup — primary model: gemini-3.6-flash (free tier, AI Studio, Sep 2026)
 genai.configure(api_key=GOOGLE_API_KEY)
 
-# Try 3.1 Flash-Lite first, fall back to whatever is available
+# gemini-3.6-flash: current free-tier Flash model as of September 2026 (released July 21 2026).
+# Fallback chain tries newer → older in case of regional availability gaps.
 GEMINI_MODEL_PREFERENCE = [
-    "gemini-3.1-flash-lite",
-    "gemini-3.0-flash-lite",
-    "gemini-2.0-flash-lite",
-    "gemini-1.5-flash-latest",
+    "gemini-3.6-flash",   # primary — free tier, AI Studio, Sep 2026
+    "gemini-3.8-flash",   # newer but may have stricter rate limits
+    "gemini-3.7-flash",
+    "gemini-2.5-flash",   # last resort — older generation
 ]
 
 def get_gemini_model() -> genai.GenerativeModel:

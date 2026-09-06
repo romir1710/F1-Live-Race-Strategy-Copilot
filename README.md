@@ -198,4 +198,5 @@ python scripts/fetch_race_data.py
 **Backend:** Python 3.12 · FastAPI · aiokafka · asyncpg · LangGraph · google-generativeai · upstash-redis · uv  
 **Frontend:** Next.js 15 · TypeScript · Tailwind CSS v4 · Inter font  
 **Data:** OpenF1 API (2024 Bahrain GP, pre-fetched)  
-**Infrastructure:** Vercel · Render · Aiven Kafka · Upstash Redis · Neon Postgres
+**Infrastructure:** Vercel · Render · Aiven Kafka · Upstash Redis · Neon Postgres  
+**AI:** Gemini 3.6 Flash (google-generativeai, free AI Studio key, primary model as of Sep 2026)
