@@ -1,0 +1,44 @@
+services:
+  # ── Single consolidated backend web service ─────────────────────────────────
+  # Hosts: replay producer + strategy consumer + WebSocket + LangGraph agent
+  # All as asyncio background tasks in one FastAPI process.
+  - type: web
+    name: f1-strategy-copilot-backend
+    env: python
+    region: oregon
+    plan: free
+    buildCommand: |
+      cd backend
+      pip install uv
+      uv pip install --system -r requirements.txt
+    startCommand: cd backend && uvicorn main:app --host 0.0.0.0 --port $PORT
+    healthCheckPath: /health
+    envVars:
+      - key: DATABASE_URL
+        sync: false   # paste from Neon dashboard
+      - key: DATABASE_URL_SYNC
+        sync: false
+      - key: KAFKA_BOOTSTRAP_SERVERS
+        sync: false   # paste from Aiven dashboard
+      - key: KAFKA_SASL_USERNAME
+        sync: false
+      - key: KAFKA_SASL_PASSWORD
+        sync: false
+      - key: KAFKA_CA_CERT_PATH
+        value: ./kafka-ca.pem
+      - key: UPSTASH_REDIS_REST_URL
+        sync: false   # paste from Upstash dashboard
+      - key: UPSTASH_REDIS_REST_TOKEN
+        sync: false
+      - key: GOOGLE_API_KEY
+        sync: false   # paste from Google AI Studio
+      - key: SESSION_KEY
+        value: "9158"  # update after Phase 1 validation
+      - key: FOCUS_DRIVERS
+        value: "1,11,16"  # update after Phase 1 data validation
+      - key: REPLAY_SPEED
+        value: "1.0"
+      - key: ENVIRONMENT
+        value: production
+      - key: PYTHON_VERSION
+        value: "3.12"

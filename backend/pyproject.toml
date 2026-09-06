@@ -1,0 +1,32 @@
+[project]
+name = "backend"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+authors = [
+    { name = "Romir Tandon", email = "rt7715f@gre.ac.uk" }
+]
+requires-python = ">=3.11"
+dependencies = [
+    "aiokafka>=0.14.0",
+    "alembic>=1.19.2",
+    "asyncpg>=0.31.0",
+    "fastapi>=0.141.1",
+    "google-generativeai>=0.8.0",
+    "httpx>=0.28.1",
+    "langgraph>=1.2.11",
+    "numpy>=2.4.6",
+    "psycopg2-binary>=2.9.12",
+    "python-dotenv>=1.2.3",
+    "requests>=2.34.2",
+    "sqlalchemy>=2.0.52",
+    "upstash-redis>=1.8.0",
+    "uvicorn[standard]>=0.52.4",
+]
+
+[project.scripts]
+backend = "backend:main"
+
+[build-system]
+requires = ["uv_build>=0.12.10,<0.13.0"]
+build-backend = "uv_build"

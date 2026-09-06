@@ -1,0 +1,62 @@
+@import "tailwindcss";
+
+/* ── Custom properties ──────────────────────────────────────────────────────── */
+:root {
+  --font-inter: "Inter", system-ui, -apple-system, sans-serif;
+  --color-f1-red: #e8002d;
+  --color-f1-red-dark: #b00022;
+}
+
+/* ── Base reset ─────────────────────────────────────────────────────────────── */
+*, *::before, *::after {
+  box-sizing: border-box;
+}
+
+html {
+  color-scheme: dark;
+}
+
+body {
+  background: #09090b;  /* zinc-950 */
+  color: #fafafa;
+  font-family: var(--font-inter);
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+/* ── Thin scrollbar ─────────────────────────────────────────────────────────── */
+* {
+  scrollbar-width: thin;
+  scrollbar-color: rgba(255,255,255,0.08) transparent;
+}
+*::-webkit-scrollbar {
+  width: 4px;
+  height: 4px;
+}
+*::-webkit-scrollbar-thumb {
+  background: rgba(255, 255, 255, 0.08);
+  border-radius: 2px;
+}
+
+/* ── Focus ring ─────────────────────────────────────────────────────────────── */
+:focus-visible {
+  outline: 2px solid rgba(232, 0, 45, 0.5);
+  outline-offset: 2px;
+}
+
+/* ── Checkered flag gradient for race-finished banner ───────────────────────── */
+.bg-checkered-flag {
+  background-image:
+    repeating-conic-gradient(
+      rgba(255,255,255,0.06) 0% 25%,
+      transparent 0% 50%
+    );
+  background-size: 16px 16px;
+  background-color: rgba(255,255,255,0.03);
+}
+
+/* ── Monospace font for lap times / gaps ────────────────────────────────────── */
+.font-mono {
+  font-variant-numeric: tabular-nums;
+  font-feature-settings: "tnum";
+}
