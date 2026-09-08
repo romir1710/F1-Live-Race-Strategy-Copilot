@@ -50,7 +50,8 @@ ENVIRONMENT    = os.environ.get("ENVIRONMENT", "production")
 # asyncpg wants plain postgresql:// (not postgresql+asyncpg://)
 _PG_URL = DATABASE_URL.replace("postgresql+asyncpg://", "postgresql://")
 
-PG_NOTIFY_CHANNEL = "telemetry_replay"
+# No Kafka, no Redis, no LISTEN/NOTIFY needed — everything is in one process.
+# Producer writes directly to RACE_STATE; broadcaster reads from it every 2s.
 
 # ── Shared in-memory race state (replaces Redis) ──────────────────────────────
 # Keyed structure:
@@ -68,13 +69,13 @@ connected_clients: list[WebSocket] = []
 replay_current_lap: int = 1
 
 
-# ── Background task: Replay Producer ─────────────────────────────────────────
+# ── Background task: Replay + Strategy (single task, zero network per lap) ───
 async def replay_producer_task():
     """
-    Reads lap rows from Neon Postgres in replay order and publishes
-    one lap_event JSON payload per driver per lap via pg_notify().
-    Runs at REPLAY_SPEED seconds per simulated lap.
-    Loops back to lap 1 after race completes.
+    Reads lap rows from Neon Postgres once per replay loop, then processes
+    all drivers per lap directly in-process — no pg_notify, no round trips.
+    All 20 driver events per lap are processed synchronously before sleeping,
+    so REPLAY_SPEED is accurate (1 lap/sec at default settings).
     """
     global replay_current_lap
 
@@ -82,10 +83,13 @@ async def replay_producer_task():
     pool = await asyncpg.create_pool(_PG_URL, min_size=1, max_size=3)
     log.info("ReplayProducer: started ✓")
 
+    # Rolling driver state for strategy engine (keyed by driver_number)
+    driver_states: dict[int, dict] = {}
+
     try:
         while True:
             async with pool.acquire() as conn:
-                laps = await conn.fetch("""
+                rows = await conn.fetch("""
                     SELECT l.driver_number, l.lap_number, l.lap_duration,
                            l.is_pit_out_lap, l.i1_speed, l.st_speed,
                            s.compound, s.tyre_age_at_start,
@@ -124,21 +128,23 @@ async def replay_producer_task():
                     ORDER BY l.lap_number ASC, l.driver_number ASC
                 """, SESSION_KEY)
 
-            total_laps = max((r["lap_number"] for r in laps), default=TOTAL_LAPS)
-            log.info(f"ReplayProducer: {len(laps)} rows, {total_laps} laps — starting replay")
+            # Group rows by lap number: {lap_number: [row, ...]}
+            from collections import defaultdict
+            laps_grouped: dict[int, list] = defaultdict(list)
+            for row in rows:
+                laps_grouped[row["lap_number"]].append(row)
 
-            # Separate connection for NOTIFY (cannot share with pool acquire easily)
-            notify_conn = await asyncpg.connect(_PG_URL)
-            try:
-                current_lap = 1
-                for row in laps:
-                    lap_num = row["lap_number"]
+            total_laps = max(laps_grouped.keys(), default=TOTAL_LAPS)
+            log.info(f"ReplayProducer: {len(rows)} rows, {total_laps} laps — starting replay")
+            driver_states.clear()
 
-                    if lap_num > current_lap:
-                        await asyncio.sleep(REPLAY_SPEED)
-                        current_lap = lap_num
-                        replay_current_lap = current_lap
+            for lap_num in sorted(laps_grouped.keys()):
+                replay_current_lap = lap_num
+                ts_now = time.time()
 
+                # Process ALL drivers for this lap synchronously (pure in-memory, no I/O)
+                for row in laps_grouped[lap_num]:
+                    dn = row["driver_number"]
                     stint_start = row["stint_lap_start"] or 1
                     tyre_age_at_start = row["tyre_age_at_start"] or 0
                     tyre_age = tyre_age_at_start + (lap_num - stint_start)
@@ -147,8 +153,8 @@ async def replay_producer_task():
                         "session_key": SESSION_KEY,
                         "lap_number": lap_num,
                         "total_laps": total_laps,
-                        "driver_number": row["driver_number"],
-                        "abbreviation": row["abbreviation"] or str(row["driver_number"]),
+                        "driver_number": dn,
+                        "abbreviation": row["abbreviation"] or str(dn),
                         "team_name": row["team_name"] or "Unknown",
                         "team_colour": row["team_colour"] or "FFFFFF",
                         "lap_duration": row["lap_duration"],
@@ -161,16 +167,42 @@ async def replay_producer_task():
                         "gap_to_leader": row["gap_to_leader"],
                         "interval_gap": row["interval_gap"],
                         "st_speed": row["st_speed"],
-                        "ts": time.time(),
+                        "ts": ts_now,
+                    }
+                    driver_states[dn] = event
+
+                    # Update shared in-memory race state (no network, zero latency)
+                    gap_to_leader = event.get("gap_to_leader")
+                    interval_gap = event.get("interval_gap")
+                    RACE_STATE["meta"] = {
+                        "current_lap": lap_num,
+                        "total_laps": total_laps,
+                        "session_key": SESSION_KEY,
+                        "ts": ts_now,
+                    }
+                    RACE_STATE["drivers"][dn] = {
+                        "lap_number": lap_num,
+                        "position": event.get("position") or 99,
+                        "compound": event["compound"],
+                        "tyre_age": tyre_age,
+                        "gap_to_leader": gap_to_leader if isinstance(gap_to_leader, (int, float)) and gap_to_leader >= 0 else -1,
+                        "interval_gap": interval_gap if isinstance(interval_gap, (int, float)) and interval_gap >= 0 else -1,
+                        "lap_duration": event.get("lap_duration") or -1,
+                        "is_pit_lap": int(event.get("is_pit_lap", False)),
+                        "abbreviation": event.get("abbreviation", str(dn)),
+                        "team_colour": event.get("team_colour", "FFFFFF"),
+                        "team_name": event.get("team_name", "Unknown"),
+                        "driver_number": dn,
                     }
 
-                    # Publish via Postgres NOTIFY — StrategyConsumer picks this up
-                    await notify_conn.execute(
-                        f"SELECT pg_notify('{PG_NOTIFY_CHANNEL}', $1)",
-                        json.dumps(event)
-                    )
-            finally:
-                await notify_conn.close()
+                # Compute strategy for focus drivers after all drivers in this lap are updated
+                if len(driver_states) >= 3:
+                    for dn in FOCUS_DRIVERS:
+                        if dn in driver_states:
+                            _run_strategy(dn, lap_num, driver_states[dn], driver_states)
+
+                # Sleep REPLAY_SPEED once per lap — accurate regardless of driver count
+                await asyncio.sleep(REPLAY_SPEED)
 
             log.info(f"ReplayProducer: race complete (lap {total_laps}). Restarting in 5s...")
             await broadcast_all_clients({"type": "race_finished", "restart_in": 5})
@@ -181,70 +213,6 @@ async def replay_producer_task():
     finally:
         await pool.close()
 
-
-# ── Background task: Strategy Consumer ───────────────────────────────────────
-async def strategy_consumer_task():
-    """
-    LISTENs on the Postgres NOTIFY channel. For each lap_event received,
-    updates the in-process RACE_STATE dict and recomputes strategy options
-    for focus drivers. No Redis — no external calls needed.
-    """
-    log.info("StrategyConsumer: connecting to Neon Postgres (LISTEN)...")
-    conn = await asyncpg.connect(_PG_URL)
-
-    # rolling driver state keyed by driver_number
-    driver_states: dict[int, dict] = {}
-
-    async def _on_notification(conn, pid, channel, payload):
-        try:
-            event: dict = json.loads(payload)
-            dn = event["driver_number"]
-            lap = event["lap_number"]
-            driver_states[dn] = event
-
-            # Update shared in-memory race meta
-            RACE_STATE["meta"] = {
-                "current_lap": lap,
-                "total_laps": event.get("total_laps", TOTAL_LAPS),
-                "session_key": SESSION_KEY,
-                "ts": event["ts"],
-            }
-
-            # Update per-driver state
-            RACE_STATE["drivers"][dn] = {
-                "lap_number": lap,
-                "position": event.get("position") or 99,
-                "compound": event["compound"],
-                "tyre_age": event["tyre_age"],
-                "gap_to_leader": event.get("gap_to_leader") if event.get("gap_to_leader", -1) and event.get("gap_to_leader", -1) >= 0 else -1,
-                "interval_gap": event.get("interval_gap") if event.get("interval_gap", -1) and event.get("interval_gap", -1) >= 0 else -1,
-                "lap_duration": event.get("lap_duration") or -1,
-                "is_pit_lap": int(event.get("is_pit_lap", False)),
-                "abbreviation": event.get("abbreviation", str(dn)),
-                "team_colour": event.get("team_colour", "FFFFFF"),
-                "team_name": event.get("team_name", "Unknown"),
-                "driver_number": dn,
-            }
-
-            # Compute strategy only for focus drivers once we have enough state
-            if dn in FOCUS_DRIVERS and len(driver_states) >= 3:
-                _run_strategy(dn, lap, event, driver_states)
-
-        except Exception as e:
-            log.warning(f"StrategyConsumer notification error: {e}")
-
-    await conn.add_listener(PG_NOTIFY_CHANNEL, _on_notification)
-    log.info("StrategyConsumer: listening on channel '%s' ✓", PG_NOTIFY_CHANNEL)
-
-    try:
-        # Keep connection alive indefinitely; asyncpg fires callbacks on notifications
-        while True:
-            await asyncio.sleep(60)
-    except asyncio.CancelledError:
-        log.info("StrategyConsumer: shutting down")
-    finally:
-        await conn.remove_listener(PG_NOTIFY_CHANNEL, _on_notification)
-        await conn.close()
 
 
 # ── Strategy helpers ──────────────────────────────────────────────────────────
@@ -344,7 +312,6 @@ async def lifespan(app: FastAPI):
 
     tasks = [
         asyncio.create_task(replay_producer_task(), name="ReplayProducer"),
-        asyncio.create_task(strategy_consumer_task(), name="StrategyConsumer"),
         asyncio.create_task(ws_broadcaster_task(), name="WSBroadcaster"),
     ]
     background_tasks.extend(tasks)

@@ -144,14 +144,25 @@ CREATE INDEX IF NOT EXISTS idx_raw_intervals_session ON raw_intervals(session_ke
 # ── fetch + insert functions ──────────────────────────────────────────────────
 
 def find_session_key() -> int:
-    """Find the 2024 Bahrain Race session key."""
-    sessions = get("sessions", {"year": 2024, "circuit_short_name": "Bahrain"})
-    race_sessions = [s for s in sessions if s.get("session_name") == "Race"]
-    if not race_sessions:
-        raise RuntimeError("Could not find 2024 Bahrain Race session")
-    sk = race_sessions[0]["session_key"]
-    log.info(f"2024 Bahrain Race session_key = {sk}")
-    return sk
+    """Find the 2024 Bahrain (Sakhir) Race session key.
+    
+    OpenF1 uses circuit_short_name='Sakhir' for the Bahrain GP venue.
+    Hardcoded fallback: 9472 (verified via API on 2026-09-08).
+    """
+    HARDCODED_SK = 9472  # 2024 Bahrain Race — verified
+    try:
+        # OpenF1 circuit_short_name for Bahrain GP is "Sakhir"
+        sessions = get("sessions", {"year": 2024, "circuit_short_name": "Sakhir"})
+        race_sessions = [s for s in sessions if s.get("session_name") == "Race"]
+        if race_sessions:
+            sk = race_sessions[0]["session_key"]
+            log.info(f"2024 Bahrain Race session_key = {sk} (from API)")
+            return sk
+    except Exception as e:
+        log.warning(f"API lookup failed ({e}), falling back to hardcoded session_key={HARDCODED_SK}")
+    log.info(f"2024 Bahrain Race session_key = {HARDCODED_SK} (hardcoded fallback)")
+    return HARDCODED_SK
+
 
 
 def insert_drivers(cur, sk: int) -> dict[int, dict]:
@@ -233,57 +244,151 @@ def insert_pits(cur, sk: int):
     log.info(f"Inserted/updated {len(data)} pit rows")
 
 
+def _safe_gap(v) -> float | None:
+    """Coerce gap value to float, returning None for non-numeric strings like '+1 LAP'."""
+    if v is None:
+        return None
+    try:
+        return float(v)
+    except (ValueError, TypeError):
+        return None  # lapped cars show "+1 LAP" etc.
+
+
 def insert_intervals(cur, sk: int):
     """
-    Intervals come as high-frequency samples. We keep only one sample per lap
-    by grouping on lap_number (taken from the nearest lap boundary using date).
-    The laps table's date_start gives us lap-boundary timestamps for alignment.
-    For simplicity we bucket by querying with lap_number derived from the API's
-    own lap_number field when present, falling back to date-binning.
+    Intervals come as high-frequency timestamp-based samples with no lap_number.
+    We bin each sample into a lap by fetching lap date_start/date_end from raw_laps
+    and matching the interval date into the correct lap window.
+    One gap value per driver per lap (last sample in that window).
     """
     rows = get("intervals", {"session_key": sk})
-    # intervals don't have lap_number; deduplicate by taking last value per lap
-    # We'll bin by date after fetching laps timestamps
-    # For now: insert all, deduplicate on conflict to keep last gap value
-    # (lap_number will be set from OpenF1's lap_number field if available)
-    inserted = 0
-    lap_number_present = any(r.get("lap_number") for r in rows[:5])
 
+    # Check if lap_number already present (future API versions may add it)
+    lap_number_present = any(r.get("lap_number") for r in rows[:10])
     if lap_number_present:
         data = [
-            (sk, r["driver_number"], r["lap_number"], r.get("gap_to_leader"), r.get("interval"))
+            (sk, r["driver_number"], r["lap_number"], _safe_gap(r.get("gap_to_leader")), _safe_gap(r.get("interval")))
             for r in rows if r.get("lap_number")
         ]
+    else:
+        # Fetch lap boundaries from DB to bin by timestamp
+        cur.execute("""
+            SELECT driver_number, lap_number, date_start
+            FROM raw_laps WHERE session_key = %s
+            ORDER BY driver_number, lap_number
+        """, (sk,))
+        lap_rows = cur.fetchall()
+        # Build: driver_number → sorted list of (lap_number, date_start)
+        from collections import defaultdict
+        from datetime import timezone
+        lap_map: dict[int, list] = defaultdict(list)
+        for lr in lap_rows:
+            if lr[2]:  # date_start not null
+                lap_map[lr[0]].append((lr[1], lr[2]))
+        for v in lap_map.values():
+            v.sort(key=lambda x: x[1])
+
+        def _find_lap(driver_number: int, date_str: str) -> int | None:
+            if not date_str or driver_number not in lap_map:
+                return None
+            try:
+                from datetime import datetime
+                ts = datetime.fromisoformat(date_str.replace("Z", "+00:00"))
+                laps = lap_map[driver_number]
+                best = None
+                for lap_num, lap_start in laps:
+                    if lap_start.tzinfo is None:
+                        lap_start = lap_start.replace(tzinfo=timezone.utc)
+                    if ts >= lap_start:
+                        best = lap_num
+                    else:
+                        break
+                return best
+            except Exception:
+                return None
+
+        # Keep last sample per (driver, lap)
+        by_key: dict[tuple, dict] = {}
+        for r in rows:
+            lap = _find_lap(r["driver_number"], r.get("date") or r.get("date_start", ""))
+            if lap:
+                by_key[(r["driver_number"], lap)] = r
+
+        data = [
+            (sk, dn, lap, _safe_gap(r.get("gap_to_leader")), _safe_gap(r.get("interval")))
+            for (dn, lap), r in by_key.items()
+        ]
+
+    if data:
         execute_values(cur, """
             INSERT INTO raw_intervals (session_key, driver_number, lap_number, gap_to_leader, interval_gap)
             VALUES %s
             ON CONFLICT (session_key, driver_number, lap_number) DO UPDATE
               SET gap_to_leader=EXCLUDED.gap_to_leader, interval_gap=EXCLUDED.interval_gap
         """, data)
-        inserted = len(data)
-    else:
-        log.warning("intervals endpoint has no lap_number field — skipping interval bulk insert; "
-                    "will compute from lap timestamps in strategy engine")
-    log.info(f"Inserted/updated {inserted} interval rows")
+    log.info(f"Inserted/updated {len(data)} interval rows")
 
 
 def insert_positions(cur, sk: int):
+    """
+    OpenF1 /position returns timestamp-based samples with no lap_number field.
+    We derive lap_number by binning each sample's date against raw_laps date_start.
+    One position per driver per lap (last sample wins).
+    """
     rows = get("position", {"session_key": sk})
-    # Keep one position per driver per lap (last update in that lap)
-    by_driver_lap: dict[tuple, dict] = {}
+
+    # Fetch lap boundaries already stored
+    cur.execute("""
+        SELECT driver_number, lap_number, date_start
+        FROM raw_laps WHERE session_key = %s
+        ORDER BY driver_number, lap_number
+    """, (sk,))
+    lap_rows = cur.fetchall()
+    from collections import defaultdict
+    from datetime import timezone
+    lap_map: dict[int, list] = defaultdict(list)
+    for lr in lap_rows:
+        if lr[2]:
+            lap_map[lr[0]].append((lr[1], lr[2]))
+    for v in lap_map.values():
+        v.sort(key=lambda x: x[1])
+
+    def _find_lap(driver_number: int, date_str: str) -> int | None:
+        if not date_str or driver_number not in lap_map:
+            return None
+        try:
+            from datetime import datetime
+            ts = datetime.fromisoformat(date_str.replace("Z", "+00:00"))
+            best = None
+            for lap_num, lap_start in lap_map[driver_number]:
+                if lap_start.tzinfo is None:
+                    lap_start = lap_start.replace(tzinfo=timezone.utc)
+                if ts >= lap_start:
+                    best = lap_num
+                else:
+                    break
+            return best
+        except Exception:
+            return None
+
+    by_key: dict[tuple, dict] = {}
     for r in rows:
-        key = (r["driver_number"], r.get("lap_number", 0))
-        by_driver_lap[key] = r
+        date_str = r.get("date") or r.get("date_start", "")
+        lap = _find_lap(r["driver_number"], date_str)
+        if lap:
+            by_key[(r["driver_number"], lap)] = r
+
     data = [
         (sk, dn, lap, r.get("position"))
-        for (dn, lap), r in by_driver_lap.items() if lap
+        for (dn, lap), r in by_key.items()
     ]
-    execute_values(cur, """
-        INSERT INTO raw_positions (session_key, driver_number, lap_number, position)
-        VALUES %s
-        ON CONFLICT (session_key, driver_number, lap_number) DO UPDATE
-          SET position=EXCLUDED.position
-    """, data)
+    if data:
+        execute_values(cur, """
+            INSERT INTO raw_positions (session_key, driver_number, lap_number, position)
+            VALUES %s
+            ON CONFLICT (session_key, driver_number, lap_number) DO UPDATE
+              SET position=EXCLUDED.position
+        """, data)
     log.info(f"Inserted/updated {len(data)} position rows")
 
 
