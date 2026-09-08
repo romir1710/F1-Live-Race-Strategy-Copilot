@@ -1,10 +1,13 @@
 """
 agent.py — LangGraph agent for natural-language F1 strategy queries.
 
-Graph: read_race_state → parse_intent → [run_simulation | explain_current | compare_options]
+Graph: read_race_state → parse_intent → [run_simulation | explain_current]
        → compose_answer
 
-Uses Gemini 3.1 Flash-Lite (highest free daily cap on Google AI Studio).
+Reads live race state from the in-process RACE_STATE dict in main.py.
+No Redis, no external cache — all state is in-memory, always up to date.
+
+Uses Gemini 3.6 Flash (highest free daily cap on Google AI Studio, Sep 2026).
 Falls back gracefully if daily quota is exhausted: returns raw sim delta + brief note.
 """
 from __future__ import annotations
@@ -15,7 +18,6 @@ from typing import Any, Optional, TypedDict
 
 import google.generativeai as genai
 from langgraph.graph import StateGraph, END
-from upstash_redis import AsyncRedis
 
 from strategy_engine import (
     DriverState, compute_strategy_options, TOTAL_LAPS
@@ -23,8 +25,6 @@ from strategy_engine import (
 
 log = logging.getLogger("agent")
 
-REDIS_URL   = os.environ["UPSTASH_REDIS_REST_URL"]
-REDIS_TOKEN = os.environ["UPSTASH_REDIS_REST_TOKEN"]
 GOOGLE_API_KEY = os.environ["GOOGLE_API_KEY"]
 FOCUS_DRIVERS = [int(x) for x in os.environ.get("FOCUS_DRIVERS", "1,11,16").split(",")]
 
@@ -40,15 +40,15 @@ GEMINI_MODEL_PREFERENCE = [
     "gemini-2.5-flash",   # last resort — older generation
 ]
 
+
 def get_gemini_model() -> genai.GenerativeModel:
     for model_name in GEMINI_MODEL_PREFERENCE:
         try:
             m = genai.GenerativeModel(model_name)
-            # Quick ping to validate
             return m
         except Exception:
             continue
-    raise RuntimeError("No Gemini Flash-Lite model available")
+    raise RuntimeError("No Gemini Flash model available")
 
 
 # ── LangGraph state ───────────────────────────────────────────────────────────
@@ -56,7 +56,7 @@ def get_gemini_model() -> genai.GenerativeModel:
 class AgentState(TypedDict):
     question: str
     driver_hint: Optional[int]
-    race_state: dict            # from Redis
+    race_state: dict            # from in-process RACE_STATE["meta"]
     driver_states: dict         # driver_number → state dict
     strategy_states: dict       # driver_number → StrategyResult dict
     intent: str                 # "what_if" | "explain" | "compare"
@@ -69,26 +69,13 @@ class AgentState(TypedDict):
 # ── Nodes ─────────────────────────────────────────────────────────────────────
 
 async def read_race_state(state: AgentState) -> AgentState:
-    """Read current race state from Upstash Redis."""
-    redis = AsyncRedis(url=REDIS_URL, token=REDIS_TOKEN)
+    """Read current race state from the shared in-process RACE_STATE dict."""
+    # Import here to avoid circular import at module load time
+    from main import RACE_STATE
 
-    race_meta = await redis.hgetall("race:live") or {}
-    driver_states = {}
-    strategy_states = {}
-
-    # Fetch all driver states
-    keys = await redis.keys("driver:*")
-    for key in keys:
-        d = await redis.hgetall(key)
-        if d:
-            dn = int(key.split(":")[-1])
-            driver_states[dn] = d
-
-    # Fetch strategy for focus drivers
-    for dn in FOCUS_DRIVERS:
-        raw = await redis.get(f"strategy:{dn}")
-        if raw:
-            strategy_states[dn] = json.loads(raw)
+    race_meta = dict(RACE_STATE.get("meta", {}))
+    driver_states = {int(k): dict(v) for k, v in RACE_STATE.get("drivers", {}).items()}
+    strategy_states = {int(k): dict(v) for k, v in RACE_STATE.get("strategies", {}).items()}
 
     return {**state, "race_state": race_meta, "driver_states": driver_states,
             "strategy_states": strategy_states}
@@ -96,7 +83,7 @@ async def read_race_state(state: AgentState) -> AgentState:
 
 async def parse_intent(state: AgentState) -> AgentState:
     """
-    Use Gemini Flash-Lite to classify intent and extract entities.
+    Use Gemini Flash to classify intent and extract entities.
     Falls back to rule-based classification if quota is exhausted.
     """
     question = state["question"]
@@ -165,10 +152,16 @@ async def run_simulation(state: AgentState) -> AgentState:
     if not target_dn:
         target_dn = FOCUS_DRIVERS[0]  # default to first focus driver
 
-    # Build DriverState from Redis snapshot
+    # Build DriverState from in-memory snapshot
     current_lap = int(race_state.get("current_lap", 20))
     total_laps = int(race_state.get("total_laps", TOTAL_LAPS))
     target_raw = driver_states_raw.get(target_dn, {})
+
+    def _safe_float(val, default=-1):
+        try:
+            return float(val) if val is not None else default
+        except (ValueError, TypeError):
+            return default
 
     target = DriverState(
         driver_number=target_dn,
@@ -179,22 +172,22 @@ async def run_simulation(state: AgentState) -> AgentState:
         current_lap=current_lap,
         compound=target_raw.get("compound", "HARD"),
         tyre_age=int(target_raw.get("tyre_age", 10)),
-        gap_to_leader=float(target_raw.get("gap_to_leader", -1)) if float(target_raw.get("gap_to_leader", -1)) > 0 else None,
-        gap_ahead=float(target_raw.get("interval_gap", -1)) if float(target_raw.get("interval_gap", -1)) > 0 else None,
+        gap_to_leader=_safe_float(target_raw.get("gap_to_leader")) if _safe_float(target_raw.get("gap_to_leader")) > 0 else None,
+        gap_ahead=_safe_float(target_raw.get("interval_gap")) if _safe_float(target_raw.get("interval_gap")) > 0 else None,
         gap_behind=None,
-        last_lap_time=float(target_raw.get("lap_duration", -1)) if float(target_raw.get("lap_duration", -1)) > 0 else None,
+        last_lap_time=_safe_float(target_raw.get("lap_duration")) if _safe_float(target_raw.get("lap_duration")) > 0 else None,
         laps_remaining=max(1, total_laps - current_lap),
     )
 
     # Apply what-if modification
-    pit_delta = entities.get("pit_delta")  # e.g. -2 means "2 laps earlier"
+    pit_delta = entities.get("pit_delta")
     forced_lap = None
     if pit_delta is not None:
         forced_lap = max(current_lap, current_lap + int(pit_delta))
 
     forced_compound = entities.get("compound")
 
-    # Run actual simulation (not a canned response)
+    # Run actual simulation
     all_focus = [
         DriverState(
             driver_number=dn,
@@ -214,10 +207,7 @@ async def run_simulation(state: AgentState) -> AgentState:
         for dn in FOCUS_DRIVERS if dn in driver_states_raw
     ]
 
-    # Actual outcome (what happened / is happening)
     actual_result = compute_strategy_options(target, all_focus)
-
-    # Hypothetical outcome (what the user asked about)
     hypo_result = compute_strategy_options(
         target, all_focus,
         force_pit_lap=forced_lap,
@@ -242,7 +232,7 @@ async def explain_current(state: AgentState) -> AgentState:
 
 async def compose_answer(state: AgentState) -> AgentState:
     """
-    Write the final answer using Gemini Flash-Lite grounded in sim_result.
+    Write the final answer using Gemini grounded in sim_result.
     Falls back to a structured text answer from raw data if quota is exhausted.
     """
     question = state["question"]
@@ -250,7 +240,6 @@ async def compose_answer(state: AgentState) -> AgentState:
     race_lap = state["race_state"].get("current_lap", "?")
     total_laps = state["race_state"].get("total_laps", TOTAL_LAPS)
 
-    # Build context string for Gemini
     context = json.dumps(sim_result, indent=2)[:3000]  # trim to avoid token overflow
 
     prompt = f"""You are a Formula 1 race strategy engineer answering a question live during a race.
@@ -265,7 +254,6 @@ Question: "{question}"
 Answer:"""
 
     if state.get("quota_exhausted", False):
-        # Fallback: don't call Gemini, compose from raw data
         answer = _quota_fallback_answer(question, sim_result, race_lap)
         return {**state, "answer": answer, "quota_exhausted": True}
 

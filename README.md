@@ -6,8 +6,6 @@
 &nbsp;
 [![Vercel](https://img.shields.io/badge/Frontend-Vercel-000?logo=vercel)](https://vercel.com)
 [![Render](https://img.shields.io/badge/Backend-Render-46E3B7?logo=render)](https://render.com)
-[![Kafka](https://img.shields.io/badge/Broker-Aiven%20Kafka-FF0000)](https://aiven.io)
-[![Redis](https://img.shields.io/badge/Cache-Upstash%20Redis-00C896)](https://upstash.com)
 [![Neon](https://img.shields.io/badge/DB-Neon%20Postgres-12FFF7)](https://neon.tech)
 
 ---
@@ -16,7 +14,7 @@
 
 ### Part 1 — Live Strategy Engine
 
-Replays real **2024 Bahrain GP telemetry** (lap times, tyre stints, pit stops, inter-car gaps) through a Kafka pipeline at accelerated speed, and **continuously computes a 3-way branching strategy comparison** per focus driver — updating every lap as the replay advances.
+Replays real **2024 Bahrain GP telemetry** (lap times, tyre stints, pit stops, inter-car gaps) at accelerated speed via an event-driven pipeline, and **continuously computes a 3-way branching strategy comparison** per focus driver — updating every lap as the replay advances.
 
 | Option | What it computes |
 |--------|-----------------|
@@ -46,29 +44,39 @@ A **LangGraph agent** answers questions like *"what if Perez had pitted a lap ea
 │  Render  —  single web service, one /health wake-up ping            │
 │                                                                     │
 │  FastAPI + asyncio background tasks:                                │
-│  ├── ReplayProducer   reads Postgres → publishes to Kafka           │
-│  ├── StrategyConsumer consumes Kafka → strategy_engine → Redis      │
-│  ├── WSBroadcaster    reads Redis every 2s → WebSocket push         │
-│  └── KafkaKeepalive   heartbeat every 5 min (prevents Aiven sleep)  │
+│  ├── ReplayProducer   reads Postgres → pg_notify(lap_event)         │
+│  ├── StrategyConsumer asyncpg LISTEN → strategy_engine → RACE_STATE │
+│  └── WSBroadcaster    reads RACE_STATE every 2s → WebSocket push    │
 │                                                                     │
-│  HTTP:  GET /health  ·  GET /ws  ·  POST /agent                    │
-└──────────────┬──────────────────────────────────┬──────────────────┘
-               │ Kafka topic: lap_events           │ WebSocket
-               ▼ ~6 KB/s at 1× replay             ▼ push every 2s
-┌──────────────────────┐          ┌────────────────────────────────────┐
-│  Aiven Kafka         │          │  Vercel  —  Next.js 15             │
-│  (free tier)         │          │                                    │
-│  5 topics max        │          │  ├── Race Tower (live standings)   │
-│  250 KiB/s cap       │          │  ├── Strategy Cards (3-way live)   │
-└──────────────────────┘          │  ├── Agent Chat (NL queries)       │
-               │                  │  └── /api/agent  proxy             │
-               ▼                  └────────────────────────────────────┘
-┌──────────────────────┐
-│  Upstash Redis       │   On mount: silent fetch('/health', {mode:'no-cors'})
-│  race:live HASH      │   wakes Render before visitor notices delay
-│  driver:{n} HASH     │
-│  strategy:{n} JSON   │
-└──────────────────────┘
+│  RACE_STATE = plain Python dict (replaces Redis, zero external I/O) │
+│                                                                     │
+│  HTTP:  GET /health  ·  GET /ws  ·  POST /agent                     │
+└─────────────────────────────────────────────┬───────────────────────┘
+                                              │ WebSocket push every 2s
+                                              ▼
+                               ┌────────────────────────────────────┐
+                               │  Vercel  —  Next.js 15             │
+                               │                                    │
+                               │  ├── Race Tower (live standings)   │
+                               │  ├── Strategy Cards (3-way live)   │
+                               │  ├── Agent Chat (NL queries)       │
+                               │  └── /api/agent  proxy             │
+                               └────────────────────────────────────┘
+
+On mount: silent fetch('/health', {mode:'no-cors'})
+wakes Render before visitor notices the cold-start delay.
+```
+
+### Event pipeline detail
+
+```
+Neon Postgres
+  └─ ReplayProducer: SELECT laps ORDER BY lap_number
+       └─ pg_notify('telemetry_replay', lap_json)   ← Postgres built-in, no Kafka needed
+            └─ StrategyConsumer: asyncpg LISTEN
+                 └─ strategy_engine(DriverState) → StrategyResult
+                      └─ RACE_STATE["strategies"][dn]  ← in-memory dict, no Redis needed
+                           └─ WSBroadcaster: push frame every 2s to all WebSocket clients
 ```
 
 ### Natural language agent path
@@ -77,7 +85,7 @@ A **LangGraph agent** answers questions like *"what if Perez had pitted a lap ea
 User question
   → POST /api/agent  (Vercel — thin proxy, no LangGraph in serverless)
   → POST /agent      (Render — stateful LangGraph process)
-      ├── read_race_state   reads Redis: lap, compound, tyre_age, gaps
+      ├── read_race_state   reads RACE_STATE dict directly (in-process, zero latency)
       ├── parse_intent      Gemini: what-if | explain | compare + entity extraction
       ├── run_simulation    re-calls strategy_engine() with modified params
       └── compose_answer    Gemini: grounded answer referencing sim numbers
@@ -104,23 +112,21 @@ The model is labelled explicitly in the UI — *directional accuracy over overcl
 
 ### Prerequisites
 - Python 3.12+ · Node 18+ · [uv](https://astral.sh/uv)
-- Free accounts: Neon · Aiven · Upstash · Google AI Studio
+- Accounts: [Neon](https://neon.tech) · [Google AI Studio](https://aistudio.google.com)
 
 ### Backend
 ```bash
 cd backend
-
-# Install uv (fast Python package manager)
-curl -LsSf https://astral.sh/uv/install.sh | sh
 
 # Create venv + install dependencies
 uv venv --python 3.12
 source .venv/bin/activate
 uv pip install -r requirements.txt
 
-# Configure credentials
+# Configure credentials (only two services needed)
 cp .env.example .env
-# → Fill in DATABASE_URL, KAFKA_*, UPSTASH_*, GOOGLE_API_KEY
+# → Fill in DATABASE_URL, DATABASE_URL_SYNC (from Neon dashboard)
+# → Fill in GOOGLE_API_KEY (from Google AI Studio)
 
 # Seed the database (one-shot, ~2 min)
 # Downloads 2024 Bahrain race data from OpenF1 → Neon Postgres
@@ -128,10 +134,9 @@ python scripts/fetch_race_data.py
 # → Prints completeness report + recommended SESSION_KEY and FOCUS_DRIVERS values
 # → Copy those values into .env
 
-# Place kafka-ca.pem (downloaded from Aiven dashboard) in backend/
-
 # Run
 uvicorn main:app --reload
+# Visit http://localhost:8000/health — should return {"status":"ok",...}
 ```
 
 ### Frontend
@@ -155,33 +160,34 @@ Update `SESSION_KEY` and `FOCUS_DRIVERS` in Render's env vars to match the outpu
 
 ### 2 · Render — backend
 - Connect this repo → Render detects `render.yaml` automatically
-- Set all env vars from `backend/.env.example` in the Render dashboard
-- Upload `kafka-ca.pem` as a **Secret File** at path `./kafka-ca.pem`
+- Set `DATABASE_URL`, `DATABASE_URL_SYNC`, and `GOOGLE_API_KEY` in the Render dashboard
+- Update `SESSION_KEY` and `FOCUS_DRIVERS` to the values printed by the seeder script
+- No secret files needed (no Kafka CA cert required)
 
 ### 3 · Vercel — frontend
 - Connect this repo → set **Root Directory** to `frontend/`
 - Add `NEXT_PUBLIC_WS_URL` and `NEXT_PUBLIC_BACKEND_URL` in Vercel dashboard
 
 ### Cold-start smoke test *(must pass before submission)*
-1. Leave everything idle for **1+ hour** (Render sleeps, Aiven may sleep)
+1. Leave everything idle for **1+ hour** (Render sleeps after 15 min of inactivity)
 2. Open the app in a fresh browser tab
-3. **Expected:** "Connecting to race engine…" overlay → disappears within ~30s
+3. **Expected:** "Connecting to race engine…" overlay → disappears within ~60s
 4. Race tower populates; strategy cards start updating every lap
 5. Ask a question in the agent chat
 6. **Expected:** answer cites specific lap numbers and time deltas from the simulation
 
 ---
 
-## Accounts (all free, no card required)
+## Accounts (all free-forever, no card required)
 
 | Service | Sign-up | Purpose |
 |---------|---------|---------|
-| [Neon](https://neon.tech) | GitHub OAuth | Postgres — stores pre-fetched race telemetry (free-forever, no 30-day expiry) |
+| [Neon](https://neon.tech) | GitHub OAuth | Postgres — stores pre-fetched race telemetry and serves LISTEN/NOTIFY |
 | [Render](https://render.com) | GitHub OAuth | Python backend web service |
-| [Aiven](https://aiven.io) | GitHub OAuth | Apache Kafka — message broker |
-| [Upstash](https://upstash.com) | GitHub OAuth | Redis — live race state cache |
 | [Google AI Studio](https://aistudio.google.com) | Google account | Gemini 3.6 Flash API key |
 | [Vercel](https://vercel.com) | GitHub OAuth | Next.js frontend hosting |
+
+> **No Kafka. No Redis.** The message bus is Postgres `LISTEN/NOTIFY` (built into Neon — no extra service). The state cache is a plain Python dict (in-process — zero network hops). Two fewer services to sign up for, two fewer things that can go wrong.
 
 ---
 
@@ -189,10 +195,10 @@ Update `SESSION_KEY` and `FOCUS_DRIVERS` in Render's env vars to match the outpu
 
 | Layer | Technologies |
 |-------|-------------|
-| **Backend** | Python 3.12 · FastAPI · asyncio · aiokafka · asyncpg · SQLAlchemy |
+| **Backend** | Python 3.12 · FastAPI · asyncio · asyncpg (LISTEN/NOTIFY) · SQLAlchemy |
 | **AI / Agent** | LangGraph · Gemini 3.6 Flash (`google-generativeai`) |
 | **Frontend** | Next.js 15 · TypeScript · Tailwind CSS v4 · Inter |
-| **Infrastructure** | Vercel · Render · Aiven Kafka · Upstash Redis · Neon Postgres |
+| **Infrastructure** | Vercel · Render · Neon Postgres |
 | **Data** | [OpenF1 API](https://openf1.org) — 2024 Bahrain GP, pre-fetched at build time |
 
 ---
@@ -202,7 +208,7 @@ Update `SESSION_KEY` and `FOCUS_DRIVERS` in Render's env vars to match the outpu
 ```
 f1-strategy-copilot/
 ├── backend/
-│   ├── main.py                   # Single FastAPI app — all 4 background tasks
+│   ├── main.py                   # Single FastAPI app — ReplayProducer, StrategyConsumer, WSBroadcaster
 │   ├── strategy_engine.py        # Pure function: race state → 3 strategy options
 │   ├── agent.py                  # LangGraph graph + Gemini 3.6 Flash integration
 │   ├── scripts/

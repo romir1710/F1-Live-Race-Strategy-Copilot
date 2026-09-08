@@ -1,17 +1,20 @@
 """
 main.py — Single consolidated FastAPI application for the F1 Live Race Strategy Copilot.
 
-Background asyncio tasks (started on startup, no separate services needed):
-  - ReplayProducer: reads raw_laps from Neon Postgres row-by-row, publishes to Aiven Kafka
-  - StrategyConsumer: consumes lap_events from Kafka, runs strategy_engine, writes to Upstash Redis
-  - Keepalive: sends a heartbeat to Aiven Kafka every 5min to prevent free-tier sleep
+Architecture (no Kafka, no Redis — zero external messaging/cache dependencies):
+  - ReplayProducer: reads raw_laps from Neon Postgres in lap order,
+                    notifies via Postgres LISTEN/NOTIFY (pg_notify).
+  - StrategyConsumer: receives LISTEN notifications via asyncpg,
+                      runs strategy_engine, writes to in-process RACE_STATE dict.
+  - WSBroadcaster: reads RACE_STATE every 2s and pushes to all WebSocket clients.
+
+All state lives in RACE_STATE — a plain asyncio-safe Python dict. No Redis needed.
+One Render web service, single process, one wake-up ping covers everything.
 
 HTTP endpoints:
-  GET  /health          → wake-up ping target (replicate FlowState pattern)
-  GET  /ws              → WebSocket: broadcasts race state to all connected frontends
-  POST /agent           → LangGraph natural-language strategy agent
-
-One Render web service. One wake-up ping covers everything.
+  GET  /health  → wake-up ping target
+  GET  /ws      → WebSocket: broadcasts race state to all connected frontends
+  POST /agent   → LangGraph natural-language strategy agent
 """
 from __future__ import annotations
 import asyncio
@@ -23,13 +26,10 @@ from contextlib import asynccontextmanager
 from typing import Optional
 
 import asyncpg
-from aiokafka import AIOKafkaConsumer, AIOKafkaProducer
-from aiokafka.errors import KafkaConnectionError
 from dotenv import load_dotenv
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from upstash_redis import AsyncRedis
 
 from strategy_engine import (
     DriverState, compute_strategy_options, TOTAL_LAPS
@@ -40,72 +40,50 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(mess
 log = logging.getLogger("main")
 
 # ── Config ────────────────────────────────────────────────────────────────────
-DATABASE_URL       = os.environ["DATABASE_URL"]          # asyncpg format
-KAFKA_SERVERS      = os.environ["KAFKA_BOOTSTRAP_SERVERS"]
-KAFKA_USERNAME     = os.environ["KAFKA_SASL_USERNAME"]
-KAFKA_PASSWORD     = os.environ["KAFKA_SASL_PASSWORD"]
-KAFKA_CA_CERT_PATH = os.environ.get("KAFKA_CA_CERT_PATH", "./kafka-ca.pem")
-REDIS_URL          = os.environ["UPSTASH_REDIS_REST_URL"]
-REDIS_TOKEN        = os.environ["UPSTASH_REDIS_REST_TOKEN"]
-GOOGLE_API_KEY     = os.environ["GOOGLE_API_KEY"]
-SESSION_KEY        = int(os.environ.get("SESSION_KEY", "9158"))
-FOCUS_DRIVERS      = [int(x) for x in os.environ.get("FOCUS_DRIVERS", "1,11,16").split(",")]
-REPLAY_SPEED       = float(os.environ.get("REPLAY_SPEED", "1.0"))  # seconds per simulated lap
-ENVIRONMENT        = os.environ.get("ENVIRONMENT", "production")
+DATABASE_URL   = os.environ["DATABASE_URL"]          # postgresql+asyncpg://...
+GOOGLE_API_KEY = os.environ["GOOGLE_API_KEY"]
+SESSION_KEY    = int(os.environ.get("SESSION_KEY", "9158"))
+FOCUS_DRIVERS  = [int(x) for x in os.environ.get("FOCUS_DRIVERS", "1,11,16").split(",")]
+REPLAY_SPEED   = float(os.environ.get("REPLAY_SPEED", "1.0"))  # seconds per simulated lap
+ENVIRONMENT    = os.environ.get("ENVIRONMENT", "production")
 
-KAFKA_TOPIC        = "lap_events"
-KAFKA_KEEPALIVE    = "keepalive"
-REDIS_RACE_KEY     = "race:live"
-REDIS_STRATEGY_KEY = "strategy:{dn}"
-REDIS_DRIVER_KEY   = "drivers:meta"
+# asyncpg wants plain postgresql:// (not postgresql+asyncpg://)
+_PG_URL = DATABASE_URL.replace("postgresql+asyncpg://", "postgresql://")
 
-# ── Shared state ──────────────────────────────────────────────────────────────
+PG_NOTIFY_CHANNEL = "telemetry_replay"
+
+# ── Shared in-memory race state (replaces Redis) ──────────────────────────────
+# Keyed structure:
+#   RACE_STATE["meta"]            → {current_lap, total_laps, session_key, ts}
+#   RACE_STATE["drivers"][dn]     → per-driver state dict
+#   RACE_STATE["strategies"][dn]  → StrategyResult dict (focus drivers only)
+RACE_STATE: dict = {
+    "meta": {},
+    "drivers": {},
+    "strategies": {},
+}
+
+# ── Shared WebSocket client list ──────────────────────────────────────────────
 connected_clients: list[WebSocket] = []
-replay_paused = False
-replay_current_lap = 1
-
-
-# ── Kafka SSL helper ──────────────────────────────────────────────────────────
-def kafka_ssl_context():
-    import ssl
-    ctx = ssl.create_default_context()
-    if os.path.exists(KAFKA_CA_CERT_PATH):
-        ctx.load_verify_locations(KAFKA_CA_CERT_PATH)
-    return ctx
+replay_current_lap: int = 1
 
 
 # ── Background task: Replay Producer ─────────────────────────────────────────
 async def replay_producer_task():
     """
     Reads lap rows from Neon Postgres in replay order and publishes
-    one lap_event message per driver per lap to Kafka.
+    one lap_event JSON payload per driver per lap via pg_notify().
     Runs at REPLAY_SPEED seconds per simulated lap.
     Loops back to lap 1 after race completes.
     """
-    global replay_current_lap, replay_paused
+    global replay_current_lap
 
     log.info("ReplayProducer: connecting to Neon Postgres...")
-    pool = await asyncpg.create_pool(
-        DATABASE_URL.replace("postgresql+asyncpg://", "postgresql://"),
-        min_size=1, max_size=3
-    )
-
-    log.info("ReplayProducer: connecting to Aiven Kafka...")
-    producer = AIOKafkaProducer(
-        bootstrap_servers=KAFKA_SERVERS,
-        security_protocol="SASL_SSL",
-        sasl_mechanism="PLAIN",
-        sasl_plain_username=KAFKA_USERNAME,
-        sasl_plain_password=KAFKA_PASSWORD,
-        ssl_context=kafka_ssl_context(),
-        value_serializer=lambda v: json.dumps(v).encode(),
-    )
-    await producer.start()
+    pool = await asyncpg.create_pool(_PG_URL, min_size=1, max_size=3)
     log.info("ReplayProducer: started ✓")
 
     try:
         while True:
-            # Fetch all laps for this session, ordered by lap_number then driver
             async with pool.acquire() as conn:
                 laps = await conn.fetch("""
                     SELECT l.driver_number, l.lap_number, l.lap_duration,
@@ -147,133 +125,132 @@ async def replay_producer_task():
                 """, SESSION_KEY)
 
             total_laps = max((r["lap_number"] for r in laps), default=TOTAL_LAPS)
-            log.info(f"ReplayProducer: {len(laps)} rows fetched, {total_laps} laps — starting replay")
+            log.info(f"ReplayProducer: {len(laps)} rows, {total_laps} laps — starting replay")
 
-            current_lap = 1
-            for row in laps:
-                while replay_paused:
-                    await asyncio.sleep(0.1)
+            # Separate connection for NOTIFY (cannot share with pool acquire easily)
+            notify_conn = await asyncpg.connect(_PG_URL)
+            try:
+                current_lap = 1
+                for row in laps:
+                    lap_num = row["lap_number"]
 
-                lap_num = row["lap_number"]
+                    if lap_num > current_lap:
+                        await asyncio.sleep(REPLAY_SPEED)
+                        current_lap = lap_num
+                        replay_current_lap = current_lap
 
-                # When lap number advances, sleep to simulate real time
-                if lap_num > current_lap:
-                    await asyncio.sleep(REPLAY_SPEED)
-                    current_lap = lap_num
-                    replay_current_lap = current_lap
+                    stint_start = row["stint_lap_start"] or 1
+                    tyre_age_at_start = row["tyre_age_at_start"] or 0
+                    tyre_age = tyre_age_at_start + (lap_num - stint_start)
 
-                # Compute tyre age for this lap
-                stint_start = row["stint_lap_start"] or 1
-                tyre_age_at_start = row["tyre_age_at_start"] or 0
-                tyre_age = tyre_age_at_start + (lap_num - stint_start)
+                    event = {
+                        "session_key": SESSION_KEY,
+                        "lap_number": lap_num,
+                        "total_laps": total_laps,
+                        "driver_number": row["driver_number"],
+                        "abbreviation": row["abbreviation"] or str(row["driver_number"]),
+                        "team_name": row["team_name"] or "Unknown",
+                        "team_colour": row["team_colour"] or "FFFFFF",
+                        "lap_duration": row["lap_duration"],
+                        "is_pit_out_lap": row["is_pit_out_lap"] or False,
+                        "is_pit_lap": row["pit_duration"] is not None,
+                        "pit_duration": row["pit_duration"],
+                        "compound": row["compound"] or "UNKNOWN",
+                        "tyre_age": tyre_age,
+                        "position": row["position"],
+                        "gap_to_leader": row["gap_to_leader"],
+                        "interval_gap": row["interval_gap"],
+                        "st_speed": row["st_speed"],
+                        "ts": time.time(),
+                    }
 
-                event = {
-                    "session_key": SESSION_KEY,
-                    "lap_number": lap_num,
-                    "total_laps": total_laps,
-                    "driver_number": row["driver_number"],
-                    "abbreviation": row["abbreviation"] or str(row["driver_number"]),
-                    "team_name": row["team_name"] or "Unknown",
-                    "team_colour": row["team_colour"] or "FFFFFF",
-                    "lap_duration": row["lap_duration"],
-                    "is_pit_out_lap": row["is_pit_out_lap"] or False,
-                    "is_pit_lap": row["pit_duration"] is not None,
-                    "pit_duration": row["pit_duration"],
-                    "compound": row["compound"] or "UNKNOWN",
-                    "tyre_age": tyre_age,
-                    "position": row["position"],
-                    "gap_to_leader": row["gap_to_leader"],
-                    "interval_gap": row["interval_gap"],
-                    "st_speed": row["st_speed"],
-                    "ts": time.time(),
-                }
+                    # Publish via Postgres NOTIFY — StrategyConsumer picks this up
+                    await notify_conn.execute(
+                        f"SELECT pg_notify('{PG_NOTIFY_CHANNEL}', $1)",
+                        json.dumps(event)
+                    )
+            finally:
+                await notify_conn.close()
 
-                await producer.send(KAFKA_TOPIC, event)
-
-            # Race finished — signal restart
             log.info(f"ReplayProducer: race complete (lap {total_laps}). Restarting in 5s...")
             await broadcast_all_clients({"type": "race_finished", "restart_in": 5})
             await asyncio.sleep(5)
-            # Loop back to top → next iteration restarts from lap 1
 
     except asyncio.CancelledError:
         log.info("ReplayProducer: shutting down")
     finally:
-        await producer.stop()
         await pool.close()
 
 
 # ── Background task: Strategy Consumer ───────────────────────────────────────
 async def strategy_consumer_task():
     """
-    Consumes lap_events from Kafka, runs strategy_engine.py per focus driver,
-    writes results to Upstash Redis for the WebSocket broadcaster to serve.
+    LISTENs on the Postgres NOTIFY channel. For each lap_event received,
+    updates the in-process RACE_STATE dict and recomputes strategy options
+    for focus drivers. No Redis — no external calls needed.
     """
-    log.info("StrategyConsumer: connecting to Aiven Kafka...")
-    consumer = AIOKafkaConsumer(
-        KAFKA_TOPIC,
-        bootstrap_servers=KAFKA_SERVERS,
-        security_protocol="SASL_SSL",
-        sasl_mechanism="PLAIN",
-        sasl_plain_username=KAFKA_USERNAME,
-        sasl_plain_password=KAFKA_PASSWORD,
-        ssl_context=kafka_ssl_context(),
-        group_id="strategy-consumer",
-        auto_offset_reset="latest",
-        value_deserializer=lambda v: json.loads(v.decode()),
-    )
-    await consumer.start()
-    log.info("StrategyConsumer: started ✓")
+    log.info("StrategyConsumer: connecting to Neon Postgres (LISTEN)...")
+    conn = await asyncpg.connect(_PG_URL)
 
-    redis = AsyncRedis(url=REDIS_URL, token=REDIS_TOKEN)
-
-    # rolling state: driver_number → latest event
+    # rolling driver state keyed by driver_number
     driver_states: dict[int, dict] = {}
 
-    try:
-        async for msg in consumer:
-            event: dict = msg.value
+    async def _on_notification(conn, pid, channel, payload):
+        try:
+            event: dict = json.loads(payload)
             dn = event["driver_number"]
             lap = event["lap_number"]
             driver_states[dn] = event
 
-            # Write raw race state to Redis every lap, every driver
-            await redis.hset(REDIS_RACE_KEY, mapping={
+            # Update shared in-memory race meta
+            RACE_STATE["meta"] = {
                 "current_lap": lap,
                 "total_laps": event.get("total_laps", TOTAL_LAPS),
                 "session_key": SESSION_KEY,
                 "ts": event["ts"],
-            })
+            }
 
-            # Write per-driver state
-            await redis.hset(f"driver:{dn}", mapping={
+            # Update per-driver state
+            RACE_STATE["drivers"][dn] = {
                 "lap_number": lap,
                 "position": event.get("position") or 99,
                 "compound": event["compound"],
                 "tyre_age": event["tyre_age"],
-                "gap_to_leader": event.get("gap_to_leader") or -1,
-                "interval_gap": event.get("interval_gap") or -1,
+                "gap_to_leader": event.get("gap_to_leader") if event.get("gap_to_leader", -1) and event.get("gap_to_leader", -1) >= 0 else -1,
+                "interval_gap": event.get("interval_gap") if event.get("interval_gap", -1) and event.get("interval_gap", -1) >= 0 else -1,
                 "lap_duration": event.get("lap_duration") or -1,
                 "is_pit_lap": int(event.get("is_pit_lap", False)),
                 "abbreviation": event.get("abbreviation", str(dn)),
                 "team_colour": event.get("team_colour", "FFFFFF"),
                 "team_name": event.get("team_name", "Unknown"),
-            })
+                "driver_number": dn,
+            }
 
-            # Compute strategy options only for focus drivers
+            # Compute strategy only for focus drivers once we have enough state
             if dn in FOCUS_DRIVERS and len(driver_states) >= 3:
-                _run_strategy(dn, lap, event, driver_states, redis)
+                _run_strategy(dn, lap, event, driver_states)
 
+        except Exception as e:
+            log.warning(f"StrategyConsumer notification error: {e}")
+
+    await conn.add_listener(PG_NOTIFY_CHANNEL, _on_notification)
+    log.info("StrategyConsumer: listening on channel '%s' ✓", PG_NOTIFY_CHANNEL)
+
+    try:
+        # Keep connection alive indefinitely; asyncpg fires callbacks on notifications
+        while True:
+            await asyncio.sleep(60)
     except asyncio.CancelledError:
         log.info("StrategyConsumer: shutting down")
     finally:
-        await consumer.stop()
+        await conn.remove_listener(PG_NOTIFY_CHANNEL, _on_notification)
+        await conn.close()
 
+
+# ── Strategy helpers ──────────────────────────────────────────────────────────
 
 def _make_driver_state(dn: int, event: dict, lap: int, driver_states: dict) -> DriverState:
     total = event.get("total_laps", TOTAL_LAPS)
-    # Find who's directly ahead/behind from current snapshot
-    all_positions = {d: s.get("position", 99) for d, s in driver_states.items() if s.get("position")}
     my_pos = event.get("position") or 99
     gaps_ahead = [
         s.get("interval_gap", 9999) for d, s in driver_states.items()
@@ -288,16 +265,16 @@ def _make_driver_state(dn: int, event: dict, lap: int, driver_states: dict) -> D
         current_lap=lap,
         compound=event.get("compound", "HARD"),
         tyre_age=event.get("tyre_age", 0),
-        gap_to_leader=event.get("gap_to_leader") if event.get("gap_to_leader", -1) >= 0 else None,
+        gap_to_leader=event.get("gap_to_leader") if event.get("gap_to_leader", -1) and event.get("gap_to_leader", -1) >= 0 else None,
         gap_ahead=gaps_ahead[0] if gaps_ahead else None,
         gap_behind=None,
-        last_lap_time=event.get("lap_duration") if event.get("lap_duration", -1) > 0 else None,
+        last_lap_time=event.get("lap_duration") if event.get("lap_duration", -1) and event.get("lap_duration", -1) > 0 else None,
         laps_remaining=max(1, total - lap),
     )
 
 
-def _run_strategy(dn: int, lap: int, event: dict, driver_states: dict, redis):
-    """Compute strategy options and schedule Redis write (non-blocking)."""
+def _run_strategy(dn: int, lap: int, event: dict, driver_states: dict):
+    """Compute strategy options and update RACE_STATE["strategies"] in-process."""
     try:
         focus_states = [
             _make_driver_state(d, driver_states[d], lap, driver_states)
@@ -305,43 +282,9 @@ def _run_strategy(dn: int, lap: int, event: dict, driver_states: dict, redis):
         ]
         target = _make_driver_state(dn, event, lap, driver_states)
         result = compute_strategy_options(target, focus_states)
-        asyncio.ensure_future(
-            redis.set(
-                REDIS_STRATEGY_KEY.format(dn=dn),
-                json.dumps(result.to_dict()),
-                ex=300  # expire after 5 min safety
-            )
-        )
+        RACE_STATE["strategies"][dn] = result.to_dict()
     except Exception as e:
         log.warning(f"Strategy compute failed for driver {dn}: {e}")
-
-
-# ── Background task: Aiven Keepalive ─────────────────────────────────────────
-async def kafka_keepalive_task():
-    """
-    Sends a keepalive heartbeat to Aiven Kafka every 5 minutes.
-    Prevents Aiven free-tier auto-power-off during idle periods (e.g. between replay loops).
-    """
-    log.info("KafkaKeepalive: started")
-    producer = AIOKafkaProducer(
-        bootstrap_servers=KAFKA_SERVERS,
-        security_protocol="SASL_SSL",
-        sasl_mechanism="PLAIN",
-        sasl_plain_username=KAFKA_USERNAME,
-        sasl_plain_password=KAFKA_PASSWORD,
-        ssl_context=kafka_ssl_context(),
-        value_serializer=lambda v: json.dumps(v).encode(),
-    )
-    await producer.start()
-    try:
-        while True:
-            await asyncio.sleep(300)  # 5 minutes
-            await producer.send(KAFKA_KEEPALIVE, {"type": "keepalive", "ts": time.time()})
-            log.debug("KafkaKeepalive: heartbeat sent")
-    except asyncio.CancelledError:
-        log.info("KafkaKeepalive: shutting down")
-    finally:
-        await producer.stop()
 
 
 # ── WebSocket broadcaster ─────────────────────────────────────────────────────
@@ -358,48 +301,30 @@ async def broadcast_all_clients(message: dict):
 
 async def ws_broadcaster_task():
     """
-    Reads race state from Upstash Redis every 2 seconds and broadcasts
+    Reads RACE_STATE from memory every 2 seconds and broadcasts
     a consolidated frame to all connected WebSocket clients.
     """
-    redis = AsyncRedis(url=REDIS_URL, token=REDIS_TOKEN)
     log.info("WSBroadcaster: started")
-
     try:
         while True:
             await asyncio.sleep(2)
             if not connected_clients:
                 continue
-
-            # Build broadcast frame
-            race_meta = await redis.hgetall(REDIS_RACE_KEY)
-            if not race_meta:
+            if not RACE_STATE["meta"]:
                 continue
 
-            # Fetch all driver states
-            drivers_frame = []
-            all_driver_keys = await redis.keys("driver:*")
-            for key in all_driver_keys:
-                d = await redis.hgetall(key)
-                if d:
-                    dn_str = key.split(":")[-1]
-                    d["driver_number"] = dn_str
-                    drivers_frame.append(d)
-
-            # Fetch strategy for focus drivers
-            strategies = {}
-            for dn in FOCUS_DRIVERS:
-                raw = await redis.get(REDIS_STRATEGY_KEY.format(dn=dn))
-                if raw:
-                    strategies[dn] = json.loads(raw)
+            drivers_frame = sorted(
+                RACE_STATE["drivers"].values(),
+                key=lambda d: int(d.get("position", 99))
+            )
 
             frame = {
                 "type": "race_update",
-                "race": race_meta,
-                "drivers": sorted(drivers_frame, key=lambda d: int(d.get("position", 99))),
-                "strategies": strategies,
+                "race": RACE_STATE["meta"],
+                "drivers": drivers_frame,
+                "strategies": {str(k): v for k, v in RACE_STATE["strategies"].items()},
                 "focus_drivers": FOCUS_DRIVERS,
             }
-
             await broadcast_all_clients(frame)
     except asyncio.CancelledError:
         log.info("WSBroadcaster: shutting down")
@@ -408,14 +333,12 @@ async def ws_broadcaster_task():
 # ── App lifespan ──────────────────────────────────────────────────────────────
 background_tasks: list[asyncio.Task] = []
 
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     log.info("Starting F1 Race Strategy Copilot backend...")
 
-    # Validate required env vars before starting tasks
-    missing = [v for v in ["DATABASE_URL", "KAFKA_BOOTSTRAP_SERVERS", "KAFKA_SASL_USERNAME",
-                            "KAFKA_SASL_PASSWORD", "UPSTASH_REDIS_REST_URL",
-                            "UPSTASH_REDIS_REST_TOKEN", "GOOGLE_API_KEY"] if not os.environ.get(v)]
+    missing = [v for v in ["DATABASE_URL", "GOOGLE_API_KEY"] if not os.environ.get(v)]
     if missing:
         raise RuntimeError(f"Missing required environment variables: {missing}")
 
@@ -423,7 +346,6 @@ async def lifespan(app: FastAPI):
         asyncio.create_task(replay_producer_task(), name="ReplayProducer"),
         asyncio.create_task(strategy_consumer_task(), name="StrategyConsumer"),
         asyncio.create_task(ws_broadcaster_task(), name="WSBroadcaster"),
-        asyncio.create_task(kafka_keepalive_task(), name="KafkaKeepalive"),
     ]
     background_tasks.extend(tasks)
 
@@ -449,7 +371,7 @@ app.add_middleware(
 
 @app.get("/health")
 async def health():
-    """Wake-up ping target — same pattern as FlowState producer health endpoint."""
+    """Wake-up ping target — silent fetch on frontend mount wakes Render before visitor notices."""
     return {
         "status": "ok",
         "session_key": SESSION_KEY,
@@ -470,10 +392,8 @@ async def websocket_endpoint(ws: WebSocket):
     connected_clients.append(ws)
     log.info(f"WebSocket client connected. Total: {len(connected_clients)}")
     try:
-        # Send a "connected" ack immediately so frontend can drop "Connecting..." overlay
         await ws.send_json({"type": "connected", "focus_drivers": FOCUS_DRIVERS})
         while True:
-            # Keep connection alive; actual data is pushed by broadcaster
             await asyncio.sleep(30)
             await ws.send_json({"type": "ping"})
     except WebSocketDisconnect:
@@ -489,20 +409,21 @@ async def websocket_endpoint(ws: WebSocket):
 
 class AgentRequest(BaseModel):
     question: str
-    driver_number: Optional[int] = None  # context hint
+    driver_number: Optional[int] = None
+
 
 class AgentResponse(BaseModel):
     answer: str
     sim_table: Optional[dict] = None
-    grounded: bool = True  # always True unless quota fallback
+    grounded: bool = True
     quota_fallback: bool = False
 
 
 @app.post("/agent", response_model=AgentResponse)
 async def agent_endpoint(req: AgentRequest):
     """
-    Natural-language strategy agent powered by LangGraph + Gemini 3.1 Flash-Lite.
-    Reads live race state from Upstash Redis, runs what-if simulation if needed,
+    Natural-language strategy agent powered by LangGraph + Gemini 3.6 Flash.
+    Reads live race state from in-process RACE_STATE, runs what-if simulation,
     and returns a grounded answer — not a canned LLM response.
     """
     from agent import run_agent  # lazy import to avoid slowing startup
