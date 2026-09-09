@@ -224,7 +224,7 @@ def compute_strategy_options(
         undercut_gain_s=0.0,
         reasoning=(
             f"Stay on {driver.compound.capitalize()} (age {driver.tyre_age}). "
-            f"{'High degradation risk — consider pitting.' if stay_risk == 'HIGH' else 'Manageable tyre life for remaining stint.'}"
+            f"{'High degradation risk, consider pitting.' if stay_risk == 'HIGH' else 'Manageable tyre life for remaining stint.'}"
         ),
         confidence=0.75 if stay_risk != "HIGH" else 0.4,
     )
@@ -249,7 +249,7 @@ def compute_strategy_options(
     undercut_gain = max(0.0, -undercut_delta)
     undercut_option = StrategyOption(
         label="UNDERCUT",
-        display_name="Undercut — Pit Now",
+        display_name="Undercut: Pit Now",
         pit_this_lap=True,
         pit_in_n_laps=0,
         target_compound=fresh_compound_b,
@@ -262,7 +262,7 @@ def compute_strategy_options(
             f"~{PIT_LANE_DELTA_S:.0f}s pit loss, but fresh rubber yields ~{undercut_gain:.1f}s "
             f"over remaining {laps_rem-1} laps. "
             + (f"Could jump {driver.position - undercut_pos} car(s) if rivals stay out."
-               if undercut_pos < driver.position else "Track position vulnerable — rivals may cover.")
+               if undercut_pos < driver.position else "Track position vulnerable, rivals may cover.")
         ),
         confidence=0.70,
     )
@@ -297,7 +297,7 @@ def compute_strategy_options(
     overcut_risk = tyre_life_risk(driver.compound, driver.tyre_age, overcut_n)
     overcut_option = StrategyOption(
         label="OVERCUT",
-        display_name=f"Overcut — Pit +{overcut_n} laps",
+        display_name=f"Overcut: Pit +{overcut_n} laps",
         pit_this_lap=False,
         pit_in_n_laps=overcut_n,
         target_compound=fresh_compound_c,
