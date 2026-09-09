@@ -266,14 +266,19 @@ async def explain_current(state: AgentState) -> AgentState:
             laps_remaining=max(1, total_laps - current_lap),
         )
 
-    # Resolve mentioned driver(s) from entities — cover abbreviations like PER, RUS
-    mentioned_dns: list[int] = []
-    abbrev = entities.get("driver")
-    if abbrev:
-        abbrev_upper = abbrev.upper()
-        for dn, raw in driver_states_raw.items():
-            if raw.get("abbreviation", "").upper() == abbrev_upper:
-                mentioned_dns.append(dn)
+    # ── Find ALL drivers mentioned anywhere in the question ─────────────────
+    # Don't rely on Gemini's single-entity extraction — scan question text
+    # directly against every known abbreviation (e.g. "Compare Perez and Russell"
+    # should find both PER and RUS).
+    question_upper = state["question"].upper()
+    mentioned_dns: list[int] = [
+        dn for dn, raw in driver_states_raw.items()
+        if raw.get("abbreviation", "").upper() in question_upper
+        # also accept full surnames written in the question
+        or raw.get("abbreviation", "").upper() in [
+            w for w in question_upper.split() if len(w) >= 3
+        ]
+    ]
 
     # For any mentioned driver not already in all_strategies, compute now
     all_focus_states = [_build_driver_state(dn) for dn in FOCUS_DRIVERS if dn in driver_states_raw]
@@ -289,12 +294,11 @@ async def explain_current(state: AgentState) -> AgentState:
                 except Exception:
                     pass
 
-    # Also compute for ALL drivers if it's a broad compare question and we have capacity
-    # (only if question contains keywords suggesting full-field compare)
+    # Broad compare ("all drivers", "everyone", etc.) — compute up to 10
     question_lower = state["question"].lower()
     is_broad = any(w in question_lower for w in ["all drivers", "everyone", "field", "full grid"])
     if is_broad:
-        for dn in list(driver_states_raw.keys())[:10]:  # cap at 10 to stay fast
+        for dn in list(driver_states_raw.keys())[:10]:
             if dn not in all_strategies:
                 target = _build_driver_state(dn)
                 if target:
@@ -307,6 +311,51 @@ async def explain_current(state: AgentState) -> AgentState:
     return {**state, "sim_result": {"strategy_states": all_strategies}}
 
 
+def _compact_strategy_context(sim_result: dict, state: dict) -> str:
+    """
+    Render strategy data as compact plain text so ALL drivers fit in the
+    context window. Each driver takes ~150 chars vs ~1000 chars for indented JSON.
+
+    Format per driver:
+      [ABV] #dn | Lap L | COMPOUND age A | P_pos
+        STAY: delta=Xs, proj=Pp, risk=R, conf=C%
+        UNDERCUT: pit now -> COMPOUND, delta=Xs, proj=Pp, risk=R, conf=C%
+        OVERCUT: pit in N -> COMPOUND, delta=Xs, proj=Pp, risk=R, conf=C%
+        recommended=LABEL
+    """
+    strategy_states = sim_result.get("strategy_states", {})
+    driver_states_raw = state.get("driver_states", {})
+    lines: list[str] = []
+
+    for dn_key, strat in strategy_states.items():
+        dn = int(dn_key)
+        raw = driver_states_raw.get(dn, {})
+        abbrev = raw.get("abbreviation") or strat.get("driver", {}).get("name", str(dn))
+        lap = raw.get("lap_number", "?")
+        compound = raw.get("compound", "?")
+        tyre_age = raw.get("tyre_age", "?")
+        pos = raw.get("position", "?")
+        lines.append(f"[{abbrev}] #{dn} | Lap {lap} | {compound} age {tyre_age}L | P{pos}")
+        for opt in strat.get("options", []):
+            label = opt.get("label", "?")
+            delta = opt.get("projected_time_delta_s", 0)
+            proj_p = opt.get("projected_finish_position", "?")
+            risk = opt.get("tyre_life_risk", "?")
+            conf = int((opt.get("confidence", 0)) * 100)
+            tgt = opt.get("target_compound", "?")
+            pit_n = opt.get("pit_in_n_laps", 0)
+            rec = " [RECOMMENDED]" if opt.get("label") == strat.get("recommended") else ""
+            if label == "STAY":
+                lines.append(f"  STAY: delta={delta:+.1f}s, proj=P{proj_p}, risk={risk}, conf={conf}%{rec}")
+            elif label == "UNDERCUT":
+                lines.append(f"  UNDERCUT: pit now->{tgt}, delta={delta:+.1f}s, proj=P{proj_p}, risk={risk}, conf={conf}%{rec}")
+            else:
+                lines.append(f"  OVERCUT: pit in {pit_n} laps->{tgt}, delta={delta:+.1f}s, proj=P{proj_p}, risk={risk}, conf={conf}%{rec}")
+        lines.append("")
+
+    return "\n".join(lines)
+
+
 async def compose_answer(state: AgentState) -> AgentState:
     """
     Write the final answer using Gemini grounded in sim_result.
@@ -317,7 +366,7 @@ async def compose_answer(state: AgentState) -> AgentState:
     race_lap = state["race_state"].get("current_lap", "?")
     total_laps = state["race_state"].get("total_laps", TOTAL_LAPS)
 
-    context = json.dumps(sim_result, indent=2)[:3000]  # trim to avoid token overflow
+    context = _compact_strategy_context(sim_result, state)
 
     prompt = f"""You are a Formula 1 race strategy engineer answering a question live during a race.
 Answer concisely and precisely (3–5 sentences max). Reference specific numbers from the simulation data.
