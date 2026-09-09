@@ -195,6 +195,14 @@ async def replay_producer_task():
                         "driver_number": dn,
                     }
 
+                # ── Position inference ─────────────────────────────────────────
+                # raw_positions has sparse coverage (~253 rows / 1140 possible).
+                # Derive missing positions from gap_to_leader ordering:
+                #   leader  → gap_to_leader is None or 0.0  → P1
+                #   others  → sorted ascending by gap_to_leader → P2, P3 …
+                # Drivers with no gap data at all keep any known position or 99.
+                _infer_and_patch_positions(driver_states)
+
                 # Compute strategy for focus drivers after all drivers in this lap are updated
                 if len(driver_states) >= 3:
                     for dn in FOCUS_DRIVERS:
@@ -217,12 +225,58 @@ async def replay_producer_task():
 
 # ── Strategy helpers ──────────────────────────────────────────────────────────
 
+def _infer_and_patch_positions(driver_states: dict[int, dict]) -> None:
+    """
+    raw_positions has sparse coverage. For any lap, infer positions from
+    gap_to_leader ordering and patch both driver_states and RACE_STATE["drivers"].
+
+    Ordering rules:
+      • gap_to_leader is None or 0.0  → leader (P1)
+      • gap_to_leader > 0             → sorted ascending → P2, P3 …
+      • gap_to_leader missing/unknown → keep existing position, or last slot
+    """
+    # Separate into: leader candidates, drivers with positive gap, no-data drivers
+    leaders: list[int] = []
+    with_gap: list[tuple[int, float]] = []
+    no_data: list[int] = []
+
+    for dn, s in driver_states.items():
+        gtl = s.get("gap_to_leader")
+        if gtl is None or (isinstance(gtl, (int, float)) and gtl == 0.0):
+            leaders.append(dn)
+        elif isinstance(gtl, (int, float)) and gtl > 0:
+            with_gap.append((dn, float(gtl)))
+        else:
+            no_data.append(dn)
+
+    with_gap.sort(key=lambda x: x[1])
+
+    # Assign sequential positions
+    pos = 1
+    order: list[int] = []
+    order.extend(leaders)
+    order.extend(dn for dn, _ in with_gap)
+    order.extend(no_data)
+
+    for dn in order:
+        driver_states[dn]["_inferred_position"] = pos
+        # Patch RACE_STATE too so the race tower always has a real position
+        if dn in RACE_STATE["drivers"]:
+            existing = RACE_STATE["drivers"][dn].get("position", 99)
+            # Prefer the raw data position if we have it; fall back to inferred
+            if existing == 99 or existing is None:
+                RACE_STATE["drivers"][dn]["position"] = pos
+        pos += 1
+
+
 def _make_driver_state(dn: int, event: dict, lap: int, driver_states: dict) -> DriverState:
     total = event.get("total_laps", TOTAL_LAPS)
-    my_pos = event.get("position") or 99
+    # Use inferred position (always reliable) if available, else raw position, else 99
+    my_pos = event.get("_inferred_position") or event.get("position") or 99
     gaps_ahead = [
         s.get("interval_gap", 9999) for d, s in driver_states.items()
-        if s.get("position") and s["position"] == my_pos - 1 and s.get("interval_gap")
+        if s.get("_inferred_position") and s["_inferred_position"] == my_pos - 1
+        and s.get("interval_gap")
     ]
     return DriverState(
         driver_number=dn,
@@ -253,6 +307,7 @@ def _run_strategy(dn: int, lap: int, event: dict, driver_states: dict):
         RACE_STATE["strategies"][dn] = result.to_dict()
     except Exception as e:
         log.warning(f"Strategy compute failed for driver {dn}: {e}")
+
 
 
 # ── WebSocket broadcaster ─────────────────────────────────────────────────────
