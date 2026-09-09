@@ -226,8 +226,85 @@ async def run_simulation(state: AgentState) -> AgentState:
 
 
 async def explain_current(state: AgentState) -> AgentState:
-    """For explain/compare intents: pass strategy_states directly as context."""
-    return {**state, "sim_result": {"strategy_states": state["strategy_states"]}}
+    """
+    For explain/compare intents: start with pre-computed strategy_states for
+    focus drivers, then compute strategy on-the-fly for any other driver
+    mentioned in the question so the agent can answer about all 20 drivers.
+    """
+    driver_states_raw = state["driver_states"]
+    race_state = state["race_state"]
+    entities = state["entities"]
+    current_lap = int(race_state.get("current_lap", 20))
+    total_laps = int(race_state.get("total_laps", TOTAL_LAPS))
+
+    # Start with pre-computed focus driver strategies
+    all_strategies = dict(state["strategy_states"])
+
+    def _safe_float(val, default=-1):
+        try:
+            return float(val) if val is not None else default
+        except (ValueError, TypeError):
+            return default
+
+    def _build_driver_state(dn: int) -> "DriverState | None":
+        raw = driver_states_raw.get(dn)
+        if not raw:
+            return None
+        return DriverState(
+            driver_number=dn,
+            name=raw.get("abbreviation", str(dn)),
+            team=raw.get("team_name", "Unknown"),
+            team_colour=raw.get("team_colour", "FFFFFF"),
+            position=int(raw.get("position", 99)),
+            current_lap=current_lap,
+            compound=raw.get("compound", "HARD"),
+            tyre_age=int(raw.get("tyre_age", 10)),
+            gap_to_leader=_safe_float(raw.get("gap_to_leader")) if _safe_float(raw.get("gap_to_leader")) > 0 else None,
+            gap_ahead=_safe_float(raw.get("interval_gap")) if _safe_float(raw.get("interval_gap")) > 0 else None,
+            gap_behind=None,
+            last_lap_time=_safe_float(raw.get("lap_duration")) if _safe_float(raw.get("lap_duration")) > 0 else None,
+            laps_remaining=max(1, total_laps - current_lap),
+        )
+
+    # Resolve mentioned driver(s) from entities — cover abbreviations like PER, RUS
+    mentioned_dns: list[int] = []
+    abbrev = entities.get("driver")
+    if abbrev:
+        abbrev_upper = abbrev.upper()
+        for dn, raw in driver_states_raw.items():
+            if raw.get("abbreviation", "").upper() == abbrev_upper:
+                mentioned_dns.append(dn)
+
+    # For any mentioned driver not already in all_strategies, compute now
+    all_focus_states = [_build_driver_state(dn) for dn in FOCUS_DRIVERS if dn in driver_states_raw]
+    all_focus_states = [s for s in all_focus_states if s is not None]
+
+    for dn in mentioned_dns:
+        if dn not in all_strategies and dn in driver_states_raw:
+            target = _build_driver_state(dn)
+            if target:
+                try:
+                    result = compute_strategy_options(target, all_focus_states or [target])
+                    all_strategies[dn] = result.to_dict()
+                except Exception:
+                    pass
+
+    # Also compute for ALL drivers if it's a broad compare question and we have capacity
+    # (only if question contains keywords suggesting full-field compare)
+    question_lower = state["question"].lower()
+    is_broad = any(w in question_lower for w in ["all drivers", "everyone", "field", "full grid"])
+    if is_broad:
+        for dn in list(driver_states_raw.keys())[:10]:  # cap at 10 to stay fast
+            if dn not in all_strategies:
+                target = _build_driver_state(dn)
+                if target:
+                    try:
+                        result = compute_strategy_options(target, all_focus_states or [target])
+                        all_strategies[dn] = result.to_dict()
+                    except Exception:
+                        pass
+
+    return {**state, "sim_result": {"strategy_states": all_strategies}}
 
 
 async def compose_answer(state: AgentState) -> AgentState:
