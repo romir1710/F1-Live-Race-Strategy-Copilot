@@ -227,46 +227,79 @@ async def replay_producer_task():
 
 def _infer_and_patch_positions(driver_states: dict[int, dict]) -> None:
     """
-    raw_positions has sparse coverage. For any lap, infer positions from
-    gap_to_leader ordering and patch both driver_states and RACE_STATE["drivers"].
+    Infer race positions from gap_to_leader ordering and patch driver_states
+    and RACE_STATE["drivers"].
 
-    Ordering rules:
-      • gap_to_leader is None or 0.0  → leader (P1)
-      • gap_to_leader > 0             → sorted ascending → P2, P3 …
-      • gap_to_leader missing/unknown → keep existing position, or last slot
+    The tricky case: gap_to_leader is NULL (None) for two DIFFERENT reasons:
+      1. The driver IS the race leader (gap = 0, stored as NULL by OpenF1)
+      2. The driver is LAPPED — gap was "+1 LAP" string, coerced to NULL
+
+    Disambiguation strategy (in priority order):
+      a. If any driver has raw position = 1, they are definitively the leader.
+      b. Otherwise, among drivers with gap=None, the one with the lowest
+         existing known position is the leader; the rest are lapped → go last.
+      c. Drivers with a positive gap are sorted ascending → P2, P3...
+      d. Drivers with no gap data keep their existing position or go last.
     """
-    # Separate into: leader candidates, drivers with positive gap, no-data drivers
-    leaders: list[int] = []
-    with_gap: list[tuple[int, float]] = []
-    no_data: list[int] = []
+    leaders: list[int] = []       # confirmed P1 candidate(s)
+    with_gap: list[tuple[int, float]] = []  # gap > 0, sortable
+    null_gap: list[int] = []      # gap is None — could be leader OR lapped
+    no_data: list[int] = []       # gap is -1 sentinel (truly unknown)
 
     for dn, s in driver_states.items():
         gtl = s.get("gap_to_leader")
-        if gtl is None or (isinstance(gtl, (int, float)) and gtl == 0.0):
+        if isinstance(gtl, (int, float)) and gtl == 0.0:
+            # Explicit zero — definitive leader
             leaders.append(dn)
+        elif gtl is None:
+            null_gap.append(dn)
         elif isinstance(gtl, (int, float)) and gtl > 0:
             with_gap.append((dn, float(gtl)))
         else:
+            # -1 sentinel or anything else → no usable gap data
             no_data.append(dn)
 
     with_gap.sort(key=lambda x: x[1])
 
-    # Assign sequential positions
-    pos = 1
+    # ── Resolve null_gap: leader vs lapped ────────────────────────────────────
+    # Check if any null_gap driver has raw_position == 1 (definitive leader signal)
+    def _raw_pos(dn: int) -> int:
+        return int(driver_states[dn].get("position") or 99)
+
+    if null_gap:
+        # Try to find a raw P1
+        raw_p1 = [dn for dn in null_gap if _raw_pos(dn) == 1]
+        if raw_p1:
+            # Found a raw P1 → that's the leader; remaining null_gap are lapped
+            leaders.extend(raw_p1)
+            lapped = [dn for dn in null_gap if dn not in raw_p1]
+            no_data.extend(lapped)   # lapped cars sort to the back
+        elif not leaders:
+            # No raw P1 anywhere — pick the null_gap driver with the best
+            # existing known position as the leader, rest are lapped
+            null_gap_sorted = sorted(null_gap, key=_raw_pos)
+            leaders.append(null_gap_sorted[0])
+            no_data.extend(null_gap_sorted[1:])  # rest → back
+        else:
+            # leaders list already has someone (explicit 0.0 gap) →
+            # all null_gap here are lapped
+            no_data.extend(null_gap)
+
+    # ── Build final ordered list ───────────────────────────────────────────────
     order: list[int] = []
     order.extend(leaders)
     order.extend(dn for dn, _ in with_gap)
     order.extend(no_data)
 
-    for dn in order:
+    # Assign sequential positions
+    for pos, dn in enumerate(order, start=1):
         driver_states[dn]["_inferred_position"] = pos
-        # Patch RACE_STATE too so the race tower always has a real position
+        # Patch RACE_STATE so the race tower always shows a real position
         if dn in RACE_STATE["drivers"]:
             existing = RACE_STATE["drivers"][dn].get("position", 99)
-            # Prefer the raw data position if we have it; fall back to inferred
             if existing == 99 or existing is None:
                 RACE_STATE["drivers"][dn]["position"] = pos
-        pos += 1
+
 
 
 def _make_driver_state(dn: int, event: dict, lap: int, driver_states: dict) -> DriverState:
