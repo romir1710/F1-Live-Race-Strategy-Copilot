@@ -10,6 +10,15 @@
 
 ---
 
+## Screenshots
+
+| Race Tower + Strategy Cards | Strategy Copilot Agent | Early Race View |
+|---|---|---|
+| ![Race Tower and Strategy Cards](docs/screenshots/screenshot1.png) | ![Strategy Copilot Agent](docs/screenshots/screenshot2.png) | ![Early Race View](docs/screenshots/screenshot3.png) |
+
+---
+
+
 ## What it does
 
 ### Part 1 — Live Strategy Engine
